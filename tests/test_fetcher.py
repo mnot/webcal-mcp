@@ -86,6 +86,36 @@ async def test_get_event_uses_cache(simple_ics: bytes) -> None:
 
 
 @pytest.mark.asyncio
+async def test_refresh_bypasses_ttl(simple_ics: bytes) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if "If-None-Match" in request.headers:
+            return httpx.Response(304)
+        return httpx.Response(200, content=simple_ics, headers={"etag": "v1"})
+
+    # TTL is large enough that a normal call would be served from cache.
+    source, client = _make_source(httpx.MockTransport(handler), ttl_seconds=3600)
+    try:
+        window = (
+            datetime(2026, 6, 1, tzinfo=timezone.utc),
+            datetime(2026, 6, 10, tzinfo=timezone.utc),
+        )
+        await source.events(*window)
+        await source.events(*window)  # cached, no HTTP call
+        await source.events(*window, refresh=True)  # forces revalidation
+        await source.get_event("evt-1@test", refresh=True)  # forces revalidation
+    finally:
+        await client.aclose()
+
+    # Initial fetch + two refresh-triggered conditional GETs.
+    assert len(calls) == 3
+    assert calls[1].headers.get("If-None-Match") == "v1"
+    assert calls[2].headers.get("If-None-Match") == "v1"
+
+
+@pytest.mark.asyncio
 async def test_http_error_propagates() -> None:
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="boom")

@@ -23,12 +23,19 @@ class CalendarSource(ABC):
         return False
 
     @abstractmethod
-    async def events(self, start: datetime, end: datetime) -> list[Event]:
-        """Return events occurring within [start, end), recurrences expanded."""
+    async def events(self, start: datetime, end: datetime, *, refresh: bool = False) -> list[Event]:
+        """Return events occurring within [start, end), recurrences expanded.
+
+        If `refresh` is True, bypass the TTL cache and revalidate against
+        the upstream source.
+        """
 
     @abstractmethod
-    async def get_event(self, uid: str) -> Event | None:
-        """Return the master VEVENT for `uid`, or None if not present."""
+    async def get_event(self, uid: str, *, refresh: bool = False) -> Event | None:
+        """Return the master VEVENT for `uid`, or None if not present.
+
+        If `refresh` is True, bypass the TTL cache and revalidate.
+        """
 
     async def aclose(self) -> None:
         """Release any held resources."""

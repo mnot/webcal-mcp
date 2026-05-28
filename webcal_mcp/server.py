@@ -139,6 +139,7 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         location: str | None = None,
         detail: Detail = "brief",
         limit: int = 100,
+        refresh: bool = False,
     ) -> Any:
         """List events in a date range, with optional filters.
 
@@ -151,10 +152,13 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         - `detail`: 'brief' (uid/title/dates), 'full' (all fields as JSON), or
           'markdown' (LLM-friendly formatted block).
         - `limit`: cap on returned events (default 100, max 500).
+        - `refresh`: if True, bypass the TTL cache and re-fetch from the
+          upstream calendar. Use when the user just edited the calendar and
+          the cached copy may be stale.
         """
         source = registry.resolve(calendar)
         start_dt, end_dt = _resolve_window(start, end)
-        events = await source.events(start_dt, end_dt)
+        events = await source.events(start_dt, end_dt, refresh=refresh)
         events = _filter(events, query=query, categories=categories, location=location)
         limit = max(1, min(limit, MAX_RESULTS))
         events = events[:limit]
@@ -165,15 +169,20 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         date: str,
         calendar: str | None = None,
         detail: Detail = "brief",
+        refresh: bool = False,
     ) -> Any:
-        """Return events occurring on a specific date (YYYY-MM-DD)."""
+        """Return events occurring on a specific date (YYYY-MM-DD).
+
+        Pass `refresh=True` to bypass the TTL cache and re-fetch the
+        upstream calendar.
+        """
         source = registry.resolve(calendar)
         day = _parse_when(date)
         if day is None:
             raise ValueError("date is required")
         start = datetime.combine(day.date(), time.min, tzinfo=day.tzinfo)
         end = start + timedelta(days=1)
-        events = await source.events(start, end)
+        events = await source.events(start, end, refresh=refresh)
         return _render(events, detail)
 
     @mcp.tool()
@@ -181,10 +190,15 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         uid: str,
         calendar: str | None = None,
         detail: Detail = "full",
+        refresh: bool = False,
     ) -> Any:
-        """Look up a single event by UID. Returns None if not found."""
+        """Look up a single event by UID. Returns None if not found.
+
+        Pass `refresh=True` to bypass the TTL cache and re-fetch the
+        upstream calendar.
+        """
         source = registry.resolve(calendar)
-        event = await source.get_event(uid)
+        event = await source.get_event(uid, refresh=refresh)
         if event is None:
             return None
         return _render([event], detail) if detail != "markdown" else event.as_markdown()

@@ -39,10 +39,14 @@ class IcsHttpSource(CalendarSource):
         self._cache: _CacheEntry | None = None
         self._lock = asyncio.Lock()
 
-    async def _calendar(self) -> icalendar.Calendar:
+    async def _calendar(self, *, refresh: bool = False) -> icalendar.Calendar:
         async with self._lock:
             now = time.monotonic()
-            if self._cache is not None and (now - self._cache.fetched_at) < self._ttl:
+            if (
+                not refresh
+                and self._cache is not None
+                and (now - self._cache.fetched_at) < self._ttl
+            ):
                 return self._cache.calendar
 
             headers: dict[str, str] = {}
@@ -72,10 +76,10 @@ class IcsHttpSource(CalendarSource):
             )
             return cal
 
-    async def events(self, start: datetime, end: datetime) -> list[Event]:
-        cal = await self._calendar()
+    async def events(self, start: datetime, end: datetime, *, refresh: bool = False) -> list[Event]:
+        cal = await self._calendar(refresh=refresh)
         return expand_events(cal, start, end)
 
-    async def get_event(self, uid: str) -> Event | None:
-        cal = await self._calendar()
+    async def get_event(self, uid: str, *, refresh: bool = False) -> Event | None:
+        cal = await self._calendar(refresh=refresh)
         return find_master(cal, uid)
