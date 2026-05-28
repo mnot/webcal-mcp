@@ -230,6 +230,8 @@ def _list_eventkit() -> int:
     except EventKitNotAvailable as exc:
         print(f"webcal-mcp: {exc}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        return 130
     if not cals:
         print("(no EventKit calendars found)")
         return 0
@@ -254,10 +256,13 @@ def main() -> None:
 
     try:
         server.run()
+    except KeyboardInterrupt:
+        # Plain Ctrl-C at the terminal — exit quietly without a traceback.
+        pass
     finally:
         try:
             asyncio.run(registry.aclose())
-        except RuntimeError:
+        except (RuntimeError, KeyboardInterrupt):
             pass
 
 
