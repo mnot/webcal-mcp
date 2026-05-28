@@ -1,0 +1,16 @@
+# Copy to ~/.config/webcal-mcp/config.toml, or point WEBCAL_MCP_CONFIG at it.
+
+# How long fetched ICS responses are kept before re-fetching. ETag and
+# Last-Modified are honoured, so revalidation is cheap.
+default_ttl_seconds = 900
+http_timeout_seconds = 30.0
+user_agent = "webcal-mcp/0.1"
+
+[calendars.personal]
+url = "webcal://example.com/personal.ics"
+description = "Personal calendar"
+
+[calendars.work]
+url = "https://example.com/work.ics"
+description = "Work calendar"
+ttl_seconds = 1800
