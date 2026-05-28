@@ -11,7 +11,7 @@ import httpx
 from dateutil import parser as dateparse
 from mcp.server.fastmcp import FastMCP
 
-from .config import Config, load_config
+from .config import CalendarConfig, Config, load_config
 from .fetcher import IcsHttpSource
 from .parser import Event
 from .source import CalendarSource
@@ -31,8 +31,19 @@ class CalendarRegistry:
             follow_redirects=True,
         )
         self._sources: dict[str, CalendarSource] = {
-            name: IcsHttpSource(c, self._client) for name, c in config.calendars.items()
+            name: self._build_source(c) for name, c in config.calendars.items()
         }
+
+    def _build_source(self, cfg: CalendarConfig) -> CalendarSource:
+        if cfg.source == "ics":
+            return IcsHttpSource(cfg, self._client)
+        if cfg.source == "eventkit":
+            # Imported lazily so non-Darwin platforms (and the import-time
+            # path on Darwin without PyObjC installed) don't pay the cost.
+            from .eventkit import EventKitSource  # pylint: disable=import-outside-toplevel
+
+            return EventKitSource(cfg)
+        raise ValueError(f"Unknown calendar source {cfg.source!r} for {cfg.name!r}")
 
     @property
     def config(self) -> Config:
@@ -206,7 +217,32 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
     return mcp
 
 
+def _list_eventkit() -> int:
+    # Imported lazily so the server entry point doesn't require PyObjC
+    # just to print a help message.
+    from .eventkit import (  # pylint: disable=import-outside-toplevel
+        EventKitNotAvailable,
+        list_eventkit_calendars,
+    )
+
+    try:
+        cals = list_eventkit_calendars()
+    except EventKitNotAvailable as exc:
+        print(f"webcal-mcp: {exc}", file=sys.stderr)
+        return 2
+    if not cals:
+        print("(no EventKit calendars found)")
+        return 0
+    width = max(len(cal["title"]) for cal in cals)
+    for cal in cals:
+        print(f"{cal['title']:<{width}}  {cal['identifier']}  [{cal['source']}]")
+    return 0
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "list-eventkit":
+        sys.exit(_list_eventkit())
+
     try:
         config = load_config()
     except (FileNotFoundError, ValueError) as exc:

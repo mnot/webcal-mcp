@@ -24,7 +24,9 @@ DEFAULT_TTL_SECONDS = 900
 @dataclass(frozen=True)
 class CalendarConfig:
     name: str
-    url: str
+    source: str = "ics"
+    url: str = ""
+    identifier: str = ""
     ttl_seconds: int = DEFAULT_TTL_SECONDS
     description: str = ""
 
@@ -80,12 +82,24 @@ def load_config(path: Path | None = None) -> Config:
     for name, entry in raw_cals.items():
         if not isinstance(entry, dict):
             raise ValueError(f"calendar {name!r} must be a table")
-        url = entry.get("url")
-        if not isinstance(url, str) or not url:
-            raise ValueError(f"calendar {name!r} missing 'url'")
+        source = str(entry.get("source", "ics"))
+        if source == "ics":
+            url = entry.get("url")
+            if not isinstance(url, str) or not url:
+                raise ValueError(f"calendar {name!r} missing 'url'")
+            identifier = ""
+        elif source == "eventkit":
+            url = ""
+            identifier = str(entry.get("identifier") or name)
+        else:
+            raise ValueError(
+                f"calendar {name!r} has unknown source {source!r} " "(expected 'ics' or 'eventkit')"
+            )
         calendars[name] = CalendarConfig(
             name=name,
+            source=source,
             url=url,
+            identifier=identifier,
             ttl_seconds=int(entry.get("ttl_seconds", default_ttl)),
             description=str(entry.get("description", "")),
         )

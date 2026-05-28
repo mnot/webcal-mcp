@@ -14,3 +14,11 @@ description = "Personal calendar"
 url = "https://example.com/work.ics"
 description = "Work calendar"
 ttl_seconds = 1800
+
+# macOS only: read a local calendar via EventKit. The first run will
+# prompt for Calendar access. Run `webcal-mcp list-eventkit` to discover
+# the available titles and UUIDs.
+[calendars.icloud]
+source = "eventkit"
+identifier = "Personal"
+description = "iCloud personal calendar"

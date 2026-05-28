@@ -37,6 +37,28 @@ description = "Work calendar"
 
 `webcal://` and `webcals://` URLs are normalized to `https://`.
 
+### Local calendars via EventKit (macOS)
+
+On macOS, any calendar already set up in Calendar.app — iCloud, local,
+subscribed `.ics`, CalDAV, Google — can be read directly through Apple's
+EventKit framework. No `webcal://` URL hunting required:
+
+```toml
+[calendars.personal]
+source = "eventkit"
+identifier = "Personal"   # display name from Calendar.app, or its UUID
+description = "iCloud personal calendar"
+```
+
+`identifier` matches the calendar's display name first, then falls back
+to its UUID. Run `webcal-mcp list-eventkit` to see what's available
+(this dumps `title  uuid  [source]` for every calendar).
+
+First use triggers a one-time TCC prompt for Calendar access; the grant
+is bound to the binary that invokes EventKit (the Python interpreter
+behind `webcal-mcp`), so re-granting may be needed if you reinstall.
+The PyObjC dependency installs automatically on macOS only.
+
 ## Run
 
 ```

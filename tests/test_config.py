@@ -65,6 +65,63 @@ def test_missing_url_rejected(tmp_path: Path) -> None:
         )
 
 
+def test_eventkit_source(tmp_path: Path) -> None:
+    cfg = load_config(
+        _write(
+            tmp_path,
+            """\
+            [calendars.personal]
+            source = "eventkit"
+            identifier = "Personal"
+            description = "iCloud personal"
+            """,
+        )
+    )
+    cal = cfg.calendars["personal"]
+    assert cal.source == "eventkit"
+    assert cal.identifier == "Personal"
+    assert cal.url == ""
+
+
+def test_eventkit_identifier_defaults_to_name(tmp_path: Path) -> None:
+    cfg = load_config(
+        _write(
+            tmp_path,
+            """\
+            [calendars.Work]
+            source = "eventkit"
+            """,
+        )
+    )
+    assert cfg.calendars["Work"].identifier == "Work"
+
+
+def test_unknown_source_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unknown source"):
+        load_config(
+            _write(
+                tmp_path,
+                """\
+                [calendars.bad]
+                source = "carrier-pigeon"
+                """,
+            )
+        )
+
+
+def test_ics_source_still_requires_url(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="missing 'url'"):
+        load_config(
+            _write(
+                tmp_path,
+                """\
+                [calendars.bad]
+                source = "ics"
+                """,
+            )
+        )
+
+
 def test_no_calendars_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="No \\[calendars"):
         load_config(_write(tmp_path, "default_ttl_seconds = 60\n"))

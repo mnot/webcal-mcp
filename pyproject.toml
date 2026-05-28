@@ -20,6 +20,7 @@ dependencies = [
     "recurring-ical-events>=2.2",
     "python-dateutil>=2.8",
     "tomli>=2.0; python_version < '3.11'",
+    "pyobjc-framework-EventKit>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
