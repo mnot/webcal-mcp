@@ -55,7 +55,8 @@ class Config:
         return None
 
 
-def _config_path() -> Path:
+def resolve_config_path() -> Path:
+    """Locate the config file: WEBCAL_MCP_CONFIG, else the first default path."""
     if env := os.environ.get("WEBCAL_MCP_CONFIG"):
         return Path(env).expanduser()
     for path in DEFAULT_CONFIG_PATHS:
@@ -67,7 +68,7 @@ def _config_path() -> Path:
 
 
 def load_config(path: Path | None = None) -> Config:
-    cfg_path = path if path is not None else _config_path()
+    cfg_path = path if path is not None else resolve_config_path()
     with cfg_path.open("rb") as fh:
         raw: dict[str, Any] = tomllib.load(fh)
 

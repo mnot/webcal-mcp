@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from textwrap import dedent
 
 import pytest
 
-from webcal_mcp.config import CalendarConfig, Config
+from webcal_mcp.config import CalendarConfig, Config, load_config
 from webcal_mcp.parser import Event
 from webcal_mcp.server import (
     DEFAULT_WINDOW_DAYS,
@@ -119,5 +121,150 @@ async def test_build_server_registers_expected_tools() -> None:
             "events_on",
             "get_event",
         }
+    finally:
+        await reg.aclose()
+
+
+def _write_config(path: Path, body: str) -> Path:
+    path.write_text(dedent(body))
+    return path
+
+
+@pytest.mark.asyncio
+async def test_reload_picks_up_new_calendar(tmp_path: Path) -> None:
+    cfg_path = _write_config(
+        tmp_path / "config.toml",
+        """\
+        [calendars.a]
+        url = "https://example.com/a.ics"
+        """,
+    )
+    reg = CalendarRegistry(load_config(cfg_path), cfg_path)
+    try:
+        assert set(reg.config.calendars) == {"a"}
+        _write_config(
+            cfg_path,
+            """\
+            [calendars.a]
+            url = "https://example.com/a.ics"
+
+            [calendars.b]
+            url = "https://example.com/b.ics"
+            """,
+        )
+        await reg.reload()
+        assert set(reg.config.calendars) == {"a", "b"}
+    finally:
+        await reg.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_preserves_unchanged_source(tmp_path: Path) -> None:
+    cfg_path = _write_config(
+        tmp_path / "config.toml",
+        """\
+        [calendars.a]
+        url = "https://example.com/a.ics"
+
+        [calendars.b]
+        url = "https://example.com/b.ics"
+        """,
+    )
+    reg = CalendarRegistry(load_config(cfg_path), cfg_path)
+    try:
+        src_a = reg.resolve("a")
+        src_b = reg.resolve("b")
+        # Change only calendar b's URL.
+        _write_config(
+            cfg_path,
+            """\
+            [calendars.a]
+            url = "https://example.com/a.ics"
+
+            [calendars.b]
+            url = "https://example.com/b-new.ics"
+            """,
+        )
+        await reg.reload()
+        assert reg.resolve("a") is src_a  # unchanged → same object, cache kept
+        assert reg.resolve("b") is not src_b  # changed → rebuilt
+    finally:
+        await reg.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_drops_removed_calendar(tmp_path: Path) -> None:
+    cfg_path = _write_config(
+        tmp_path / "config.toml",
+        """\
+        [calendars.a]
+        url = "https://example.com/a.ics"
+
+        [calendars.b]
+        url = "https://example.com/b.ics"
+        """,
+    )
+    reg = CalendarRegistry(load_config(cfg_path), cfg_path)
+    try:
+        _write_config(
+            cfg_path,
+            """\
+            [calendars.a]
+            url = "https://example.com/a.ics"
+            """,
+        )
+        await reg.reload()
+        assert set(reg.config.calendars) == {"a"}
+        with pytest.raises(ValueError, match="Unknown calendar"):
+            reg.resolve("b")
+    finally:
+        await reg.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_keeps_config_when_file_invalid(tmp_path: Path) -> None:
+    cfg_path = _write_config(
+        tmp_path / "config.toml",
+        """\
+        [calendars.a]
+        url = "https://example.com/a.ics"
+        """,
+    )
+    reg = CalendarRegistry(load_config(cfg_path), cfg_path)
+    try:
+        cfg_path.write_text("this is not = valid toml [[[")
+        await reg.reload()  # must not raise
+        assert set(reg.config.calendars) == {"a"}  # original kept
+    finally:
+        await reg.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_rebuilds_client_when_global_settings_change(tmp_path: Path) -> None:
+    cfg_path = _write_config(
+        tmp_path / "config.toml",
+        """\
+        http_timeout_seconds = 30.0
+
+        [calendars.a]
+        url = "https://example.com/a.ics"
+        """,
+    )
+    reg = CalendarRegistry(load_config(cfg_path), cfg_path)
+    try:
+        src_a = reg.resolve("a")
+        _write_config(
+            cfg_path,
+            """\
+            http_timeout_seconds = 5.0
+
+            [calendars.a]
+            url = "https://example.com/a.ics"
+            """,
+        )
+        await reg.reload()
+        # Even though calendar a is unchanged, a new client forces a rebuild.
+        assert reg.resolve("a") is not src_a
+        assert reg.config.http_timeout_seconds == 5.0
     finally:
         await reg.aclose()

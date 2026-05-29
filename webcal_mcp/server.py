@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import sys
 from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 from dateutil import parser as dateparse
 from mcp.server.fastmcp import FastMCP
 
-from .config import CalendarConfig, Config, load_config
+from .config import CalendarConfig, Config, load_config, resolve_config_path
 from .fetcher import IcsHttpSource
 from .parser import Event
 from .source import CalendarSource
@@ -23,16 +24,72 @@ MAX_RESULTS = 500
 
 
 class CalendarRegistry:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, config_path: Path | None = None) -> None:
         self._config = config
-        self._client = httpx.AsyncClient(
+        self._config_path = config_path
+        self._client = self._make_client(config)
+        self._sources: dict[str, CalendarSource] = {
+            name: self._build_source(c) for name, c in config.calendars.items()
+        }
+        self._reload_lock = asyncio.Lock()
+
+    @staticmethod
+    def _make_client(config: Config) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
             timeout=config.http_timeout_seconds,
             headers={"User-Agent": config.user_agent},
             follow_redirects=True,
         )
-        self._sources: dict[str, CalendarSource] = {
-            name: self._build_source(c) for name, c in config.calendars.items()
-        }
+
+    async def reload(self) -> None:
+        """Re-read the config file and apply any changes in place.
+
+        Sources whose config is unchanged are kept as-is (preserving their
+        caches); new and changed calendars are rebuilt, removed ones are
+        closed. If the file is missing or invalid, the current config is
+        left untouched. Called from `list_calendars` so config edits land
+        without restarting the server.
+        """
+        async with self._reload_lock:
+            try:
+                new_config = load_config(self._config_path)
+            except (FileNotFoundError, ValueError, OSError) as exc:
+                print(
+                    f"webcal-mcp: config reload failed, keeping current config: {exc}",
+                    file=sys.stderr,
+                )
+                return
+            if new_config == self._config:
+                return
+
+            # Global HTTP settings are baked into the client; if they changed
+            # the client (and therefore every ICS source) must be rebuilt.
+            client_changed = (
+                new_config.http_timeout_seconds != self._config.http_timeout_seconds
+                or new_config.user_agent != self._config.user_agent
+            )
+            old_client = self._client
+            if client_changed:
+                self._client = self._make_client(new_config)
+
+            new_sources: dict[str, CalendarSource] = {}
+            for name, cfg in new_config.calendars.items():
+                reuse = (
+                    not client_changed
+                    and name in self._sources
+                    and self._config.calendars.get(name) == cfg
+                )
+                new_sources[name] = self._sources[name] if reuse else self._build_source(cfg)
+
+            old_sources = self._sources
+            self._sources = new_sources
+            self._config = new_config
+
+            for name, src in old_sources.items():
+                if src is not new_sources.get(name):
+                    await src.aclose()
+            if client_changed:
+                await old_client.aclose()
 
     def _build_source(self, cfg: CalendarConfig) -> CalendarSource:
         if cfg.source == "ics":
@@ -130,7 +187,12 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
 
     @mcp.tool()
     async def list_calendars() -> list[dict[str, Any]]:
-        """List the configured calendars."""
+        """List the configured calendars.
+
+        Re-reads the config file first, so calendars added or changed
+        since the server started are picked up without a restart.
+        """
+        await registry.reload()
         return [
             {
                 "name": c.name,
@@ -246,12 +308,13 @@ def main() -> None:
         sys.exit(_list_eventkit())
 
     try:
-        config = load_config()
+        config_path = resolve_config_path()
+        config = load_config(config_path)
     except (FileNotFoundError, ValueError) as exc:
         print(f"webcal-mcp: {exc}", file=sys.stderr)
         sys.exit(2)
 
-    registry = CalendarRegistry(config)
+    registry = CalendarRegistry(config, config_path)
     server = build_server(registry)
 
     try:

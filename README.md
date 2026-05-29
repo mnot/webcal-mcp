@@ -77,7 +77,7 @@ claude mcp add webcal -- webcal-mcp
 
 | Tool | Purpose |
 | --- | --- |
-| `list_calendars` | Names, descriptions, capability flags for the configured calendars. |
+| `list_calendars` | Names, descriptions, capability flags for the configured calendars. Re-reads the config file, so calendars added or changed since startup appear without restarting the server. |
 | `list_events` | Events in a date range, with optional `query`, `categories`, `location` filters and `brief` / `full` / `markdown` detail modes. Either bound may be omitted for open-ended windows. |
 | `events_on` | All events occurring on a given date. |
 | `get_event` | Full record for a single UID. |
