@@ -32,6 +32,36 @@ class CalendarRegistry:
             name: self._build_source(c) for name, c in config.calendars.items()
         }
         self._reload_lock = asyncio.Lock()
+        self._config_mtime = self._read_mtime()
+
+    def _read_mtime(self) -> float | None:
+        if self._config_path is None:
+            return None
+        try:
+            return self._config_path.stat().st_mtime
+        except OSError:
+            return None
+
+    async def maybe_reload(self) -> None:
+        """Reload the config if the file changed on disk since we last looked.
+
+        Just a `stat`, so it's cheap enough to call before every tool
+        invocation; the actual re-read only happens when the mtime moved.
+        Lets config edits land without the client restarting the server.
+        """
+        path = self._config_path
+        if path is None:
+            return
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+        if mtime == self._config_mtime:
+            return
+        # Record the mtime up front so a config that fails to parse isn't
+        # re-read on every call; the next edit will bump the mtime again.
+        self._config_mtime = mtime
+        await self.reload()
 
     @staticmethod
     def _make_client(config: Config) -> httpx.AsyncClient:
@@ -192,7 +222,7 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         Re-reads the config file first, so calendars added or changed
         since the server started are picked up without a restart.
         """
-        await registry.reload()
+        await registry.maybe_reload()
         return [
             {
                 "name": c.name,
@@ -229,6 +259,7 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
           upstream calendar. Use when the user just edited the calendar and
           the cached copy may be stale.
         """
+        await registry.maybe_reload()
         source = registry.resolve(calendar)
         start_dt, end_dt = _resolve_window(start, end)
         events = await source.events(start_dt, end_dt, refresh=refresh)
@@ -249,6 +280,7 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         Pass `refresh=True` to bypass the TTL cache and re-fetch the
         upstream calendar.
         """
+        await registry.maybe_reload()
         source = registry.resolve(calendar)
         day = _parse_when(date)
         if day is None:
@@ -270,6 +302,7 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         Pass `refresh=True` to bypass the TTL cache and re-fetch the
         upstream calendar.
         """
+        await registry.maybe_reload()
         source = registry.resolve(calendar)
         event = await source.get_event(uid, refresh=refresh)
         if event is None:
