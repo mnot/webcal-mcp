@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from textwrap import dedent
@@ -235,6 +236,66 @@ async def test_reload_keeps_config_when_file_invalid(tmp_path: Path) -> None:
         cfg_path.write_text("this is not = valid toml [[[")
         await reg.reload()  # must not raise
         assert set(reg.config.calendars) == {"a"}  # original kept
+    finally:
+        await reg.aclose()
+
+
+@pytest.mark.asyncio
+async def test_maybe_reload_picks_up_change_on_new_mtime(tmp_path: Path) -> None:
+    cfg_path = _write_config(
+        tmp_path / "config.toml",
+        """\
+        [calendars.a]
+        url = "https://example.com/a.ics"
+        """,
+    )
+    reg = CalendarRegistry(load_config(cfg_path), cfg_path)
+    try:
+        st = cfg_path.stat()
+        _write_config(
+            cfg_path,
+            """\
+            [calendars.a]
+            url = "https://example.com/a.ics"
+
+            [calendars.b]
+            url = "https://example.com/b.ics"
+            """,
+        )
+        # Force a distinct mtime so the gate fires regardless of clock granularity.
+        os.utime(cfg_path, (st.st_atime + 1, st.st_mtime + 1))
+        await reg.maybe_reload()
+        assert set(reg.config.calendars) == {"a", "b"}
+    finally:
+        await reg.aclose()
+
+
+@pytest.mark.asyncio
+async def test_maybe_reload_skips_when_mtime_unchanged(tmp_path: Path) -> None:
+    cfg_path = _write_config(
+        tmp_path / "config.toml",
+        """\
+        [calendars.a]
+        url = "https://example.com/a.ics"
+        """,
+    )
+    reg = CalendarRegistry(load_config(cfg_path), cfg_path)
+    try:
+        st = cfg_path.stat()
+        # Change content but restore the original mtime: the gate must not fire.
+        _write_config(
+            cfg_path,
+            """\
+            [calendars.a]
+            url = "https://example.com/a.ics"
+
+            [calendars.b]
+            url = "https://example.com/b.ics"
+            """,
+        )
+        os.utime(cfg_path, (st.st_atime, st.st_mtime))
+        await reg.maybe_reload()
+        assert set(reg.config.calendars) == {"a"}
     finally:
         await reg.aclose()
 
