@@ -224,18 +224,6 @@ def _matches(
     return True
 
 
-def _filter(
-    events: list[Event],
-    *,
-    query: str | None,
-    categories: list[str] | None,
-    location: str | None,
-) -> list[Event]:
-    return [
-        ev for ev in events if _matches(ev, query=query, categories=categories, location=location)
-    ]
-
-
 async def _gather_events(
     sources: list[CalendarSource],
     start: datetime,

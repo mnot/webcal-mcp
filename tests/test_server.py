@@ -14,8 +14,8 @@ from webcal_mcp.parser import Event
 from webcal_mcp.server import (
     DEFAULT_WINDOW_DAYS,
     CalendarRegistry,
-    _filter,
     _gather_events,
+    _matches,
     _render,
     _resolve_window,
     build_server,
@@ -72,33 +72,45 @@ def test_resolve_window_pushes_end_to_end_of_day() -> None:
     assert end.hour == 23 and end.minute == 59
 
 
-def test_filter_query_matches_summary_and_description() -> None:
+def _matching(
+    events: list[Event],
+    *,
+    query: str | None = None,
+    categories: list[str] | None = None,
+    location: str | None = None,
+) -> set[str]:
+    return {
+        e.uid
+        for e in events
+        if _matches(e, query=query, categories=categories, location=location)
+    }
+
+
+def test_matches_query_against_summary_and_description() -> None:
     events = [
         _ev("a", summary="Standup"),
         _ev("b", summary="Lunch", description="with Alice"),
         _ev("c", summary="Other"),
     ]
-    assert {e.uid for e in _filter(events, query="alice", categories=None, location=None)} == {"b"}
-    assert {e.uid for e in _filter(events, query="stand", categories=None, location=None)} == {"a"}
+    assert _matching(events, query="alice") == {"b"}
+    assert _matching(events, query="stand") == {"a"}
 
 
-def test_filter_categories_intersection() -> None:
+def test_matches_categories_intersection() -> None:
     events = [
         _ev("a", categories=("work",)),
         _ev("b", categories=("personal",)),
         _ev("c", categories=("work", "urgent")),
     ]
-    got = _filter(events, query=None, categories=["WORK"], location=None)
-    assert {e.uid for e in got} == {"a", "c"}
+    assert _matching(events, categories=["WORK"]) == {"a", "c"}
 
 
-def test_filter_location_substring() -> None:
+def test_matches_location_substring() -> None:
     events = [
         _ev("a", location="Cafe Roma"),
         _ev("b", location="Office"),
     ]
-    got = _filter(events, query=None, categories=None, location="cafe")
-    assert {e.uid for e in got} == {"a"}
+    assert _matching(events, location="cafe") == {"a"}
 
 
 def _registry(*names: str) -> CalendarRegistry:
