@@ -14,10 +14,30 @@ from webcal_mcp.parser import Event
 from webcal_mcp.server import (
     DEFAULT_WINDOW_DAYS,
     CalendarRegistry,
-    _filter,
+    _gather_events,
+    _matches,
+    _render,
     _resolve_window,
     build_server,
 )
+from webcal_mcp.source import CalendarSource
+
+
+class _FakeSource(CalendarSource):
+    """In-memory source for exercising the multi-calendar paths."""
+
+    def __init__(self, name: str, events: list[Event] | None = None, error: str | None = None):
+        self.name = name
+        self._events = events or []
+        self._error = error
+
+    async def events(self, start, end, *, refresh=False):  # type: ignore[no-untyped-def]
+        if self._error is not None:
+            raise RuntimeError(self._error)
+        return list(self._events)
+
+    async def get_event(self, uid, *, refresh=False):  # type: ignore[no-untyped-def]
+        return next((e for e in self._events if e.uid == uid), None)
 
 
 def _ev(uid: str, **kw: object) -> Event:
@@ -52,33 +72,45 @@ def test_resolve_window_pushes_end_to_end_of_day() -> None:
     assert end.hour == 23 and end.minute == 59
 
 
-def test_filter_query_matches_summary_and_description() -> None:
+def _matching(
+    events: list[Event],
+    *,
+    query: str | None = None,
+    categories: list[str] | None = None,
+    location: str | None = None,
+) -> set[str]:
+    return {
+        e.uid
+        for e in events
+        if _matches(e, query=query, categories=categories, location=location)
+    }
+
+
+def test_matches_query_against_summary_and_description() -> None:
     events = [
         _ev("a", summary="Standup"),
         _ev("b", summary="Lunch", description="with Alice"),
         _ev("c", summary="Other"),
     ]
-    assert {e.uid for e in _filter(events, query="alice", categories=None, location=None)} == {"b"}
-    assert {e.uid for e in _filter(events, query="stand", categories=None, location=None)} == {"a"}
+    assert _matching(events, query="alice") == {"b"}
+    assert _matching(events, query="stand") == {"a"}
 
 
-def test_filter_categories_intersection() -> None:
+def test_matches_categories_intersection() -> None:
     events = [
         _ev("a", categories=("work",)),
         _ev("b", categories=("personal",)),
         _ev("c", categories=("work", "urgent")),
     ]
-    got = _filter(events, query=None, categories=["WORK"], location=None)
-    assert {e.uid for e in got} == {"a", "c"}
+    assert _matching(events, categories=["WORK"]) == {"a", "c"}
 
 
-def test_filter_location_substring() -> None:
+def test_matches_location_substring() -> None:
     events = [
         _ev("a", location="Cafe Roma"),
         _ev("b", location="Office"),
     ]
-    got = _filter(events, query=None, categories=None, location="cafe")
-    assert {e.uid for e in got} == {"a"}
+    assert _matching(events, location="cafe") == {"a"}
 
 
 def _registry(*names: str) -> CalendarRegistry:
@@ -108,6 +140,80 @@ def test_resolve_defaults_to_only_calendar() -> None:
         import asyncio
 
         asyncio.run(reg.aclose())
+
+
+def test_resolve_many_none_returns_all() -> None:
+    reg = _registry("a", "b")
+    try:
+        assert [s.name for s in reg.resolve_many(None)] == ["a", "b"]
+        assert [s.name for s in reg.resolve_many([])] == ["a", "b"]
+    finally:
+        import asyncio
+
+        asyncio.run(reg.aclose())
+
+
+def test_resolve_many_single_and_list_preserve_order() -> None:
+    reg = _registry("a", "b", "c")
+    try:
+        assert [s.name for s in reg.resolve_many("b")] == ["b"]
+        assert [s.name for s in reg.resolve_many(["c", "a"])] == ["c", "a"]
+    finally:
+        import asyncio
+
+        asyncio.run(reg.aclose())
+
+
+def test_resolve_many_reports_unknown() -> None:
+    reg = _registry("a", "b")
+    try:
+        with pytest.raises(ValueError, match="Unknown calendar.*'x'"):
+            reg.resolve_many(["a", "x"])
+    finally:
+        import asyncio
+
+        asyncio.run(reg.aclose())
+
+
+def _at(uid: str, day: int) -> Event:
+    return _ev(uid, start=datetime(2026, 6, day, tzinfo=timezone.utc))
+
+
+@pytest.mark.asyncio
+async def test_gather_events_tags_and_collects() -> None:
+    src_a = _FakeSource("a", [_at("a1", 2)])
+    src_b = _FakeSource("b", [_at("b1", 1)])
+    win = _resolve_window(None, None)
+    tagged = await _gather_events([src_a, src_b], *win, refresh=False)
+    assert {(name, e.uid) for name, e in tagged} == {("a", "a1"), ("b", "b1")}
+
+
+@pytest.mark.asyncio
+async def test_gather_events_partial_failure_is_best_effort() -> None:
+    good = _FakeSource("good", [_at("g1", 1)])
+    bad = _FakeSource("bad", error="boom")
+    win = _resolve_window(None, None)
+    tagged = await _gather_events([good, bad], *win, refresh=False)
+    assert [(name, e.uid) for name, e in tagged] == [("good", "g1")]
+
+
+@pytest.mark.asyncio
+async def test_gather_events_raises_when_all_fail() -> None:
+    bad1 = _FakeSource("x", error="boom")
+    bad2 = _FakeSource("y", error="bust")
+    win = _resolve_window(None, None)
+    with pytest.raises(ValueError, match="All calendars failed"):
+        await _gather_events([bad1, bad2], *win, refresh=False)
+
+
+def test_render_tags_calendar_when_requested() -> None:
+    tagged = [("work", _ev("a")), ("home", _ev("b"))]
+    brief = _render(tagged, "brief", show_calendar=True)
+    assert [row["calendar"] for row in brief] == ["work", "home"]
+    untagged = _render(tagged, "brief", show_calendar=False)
+    assert all("calendar" not in row for row in untagged)
+    md = _render(tagged, "markdown", show_calendar=True)
+    assert "**Calendar:** work" in md and "**Calendar:** home" in md
 
 
 @pytest.mark.asyncio
