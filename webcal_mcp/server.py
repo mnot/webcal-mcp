@@ -142,6 +142,34 @@ class CalendarRegistry:
             raise ValueError(f"Unknown calendar {name!r}. Configured: {names}")
         return self._sources[name]
 
+    def resolve_many(self, name: str | list[str] | None) -> list[CalendarSource]:
+        """Resolve to one or more sources, preserving order.
+
+        - ``None`` (or an empty list) → every configured calendar
+        - a single name → just that calendar
+        - a list of names → those calendars, in the given order
+
+        Raises ``ValueError`` naming any calendars that aren't configured.
+        """
+        if name is None:
+            return list(self._sources.values())
+        names = [name] if isinstance(name, str) else list(name)
+        if not names:
+            return list(self._sources.values())
+        out: list[CalendarSource] = []
+        unknown: list[str] = []
+        for cal_name in names:
+            src = self._sources.get(cal_name)
+            if src is None:
+                unknown.append(cal_name)
+            else:
+                out.append(src)
+        if unknown:
+            configured = ", ".join(sorted(self._sources)) or "(none)"
+            bad = ", ".join(repr(u) for u in unknown)
+            raise ValueError(f"Unknown calendar(s) {bad}. Configured: {configured}")
+        return out
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -176,6 +204,26 @@ def _resolve_window(start: str | None, end: str | None) -> tuple[datetime, datet
     return start_dt, end_dt
 
 
+def _matches(
+    ev: Event,
+    *,
+    query: str | None,
+    categories: list[str] | None,
+    location: str | None,
+) -> bool:
+    if query:
+        needle = query.lower()
+        if needle not in ev.summary.lower() and needle not in ev.description.lower():
+            return False
+    if categories:
+        wanted = {c.lower() for c in categories}
+        if not wanted & {c.lower() for c in ev.categories}:
+            return False
+    if location and location.lower() not in ev.location.lower():
+        return False
+    return True
+
+
 def _filter(
     events: list[Event],
     *,
@@ -183,26 +231,55 @@ def _filter(
     categories: list[str] | None,
     location: str | None,
 ) -> list[Event]:
-    out = events
-    if query:
-        needle = query.lower()
-        out = [ev for ev in out if needle in ev.summary.lower() or needle in ev.description.lower()]
-    if categories:
-        wanted = {c.lower() for c in categories}
-        out = [ev for ev in out if wanted & {c.lower() for c in ev.categories}]
-    if location:
-        loc = location.lower()
-        out = [ev for ev in out if loc in ev.location.lower()]
-    return out
+    return [
+        ev for ev in events if _matches(ev, query=query, categories=categories, location=location)
+    ]
 
 
-def _render(events: list[Event], detail: Detail) -> Any:
+async def _gather_events(
+    sources: list[CalendarSource],
+    start: datetime,
+    end: datetime,
+    *,
+    refresh: bool,
+) -> list[tuple[str, Event]]:
+    """Fetch from each source concurrently, best-effort, tagging by calendar.
+
+    A source that fails is logged to stderr and skipped, so one unreachable
+    calendar doesn't sink the whole query. Raises only when every source
+    fails — the caller then sees a real error rather than a silent empty list.
+    """
+    results = await asyncio.gather(
+        *(src.events(start, end, refresh=refresh) for src in sources),
+        return_exceptions=True,
+    )
+    tagged: list[tuple[str, Event]] = []
+    failures: list[tuple[str, BaseException]] = []
+    for src, res in zip(sources, results):
+        if isinstance(res, Exception):
+            failures.append((src.name, res))
+        elif isinstance(res, BaseException):
+            raise res  # don't swallow cancellation / system-exiting signals
+        else:
+            tagged.extend((src.name, ev) for ev in res)
+    for name, exc in failures:
+        print(f"webcal-mcp: failed to fetch calendar {name!r}: {exc}", file=sys.stderr)
+    if failures and len(failures) == len(sources):
+        detail = "; ".join(f"{name}: {exc}" for name, exc in failures)
+        raise ValueError(f"All calendars failed to fetch: {detail}")
+    return tagged
+
+
+def _render(tagged: list[tuple[str, Event]], detail: Detail, *, show_calendar: bool) -> Any:
+    def cal(name: str) -> str | None:
+        return name if show_calendar else None
+
     if detail == "brief":
-        return [e.as_brief() for e in events]
+        return [e.as_brief(cal(name)) for name, e in tagged]
     if detail == "full":
-        return [e.as_full() for e in events]
+        return [e.as_full(cal(name)) for name, e in tagged]
     if detail == "markdown":
-        return "\n\n---\n\n".join(e.as_markdown() for e in events)
+        return "\n\n---\n\n".join(e.as_markdown(cal(name)) for name, e in tagged)
     raise ValueError(f"Unknown detail mode {detail!r}")
 
 
@@ -228,7 +305,7 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
 
     @mcp.tool()
     async def list_events(
-        calendar: str | None = None,
+        calendar: str | list[str] | None = None,
         start: str | None = None,
         end: str | None = None,
         query: str | None = None,
@@ -240,7 +317,11 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
     ) -> Any:
         """List events in a date range, with optional filters.
 
-        - `calendar`: name from `list_calendars`. Optional if only one is configured.
+        - `calendar`: a name from `list_calendars`, a list of names, or omitted.
+          Omitted (None) means *all* configured calendars; a list means just
+          those. When more than one calendar is queried, each event carries a
+          `calendar` field (a `**Calendar:**` line in markdown) and events are
+          merged and sorted by start time.
         - `start` / `end`: ISO date or datetime. Either may be omitted for an
           open-ended window; a default 30-day window applies if both are omitted.
         - `query`: case-insensitive substring match against summary + description.
@@ -248,41 +329,52 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         - `location`: case-insensitive substring match against location.
         - `detail`: 'brief' (uid/title/dates), 'full' (all fields as JSON), or
           'markdown' (LLM-friendly formatted block).
-        - `limit`: cap on returned events (default 100, max 500).
+        - `limit`: cap on returned events (default 100, max 500), applied after
+          merging and sorting across calendars.
         - `refresh`: if True, bypass the TTL cache and re-fetch from the
           upstream calendar. Use when the user just edited the calendar and
           the cached copy may be stale.
         """
         await registry.maybe_reload()
-        source = registry.resolve(calendar)
+        sources = registry.resolve_many(calendar)
         start_dt, end_dt = _resolve_window(start, end)
-        events = await source.events(start_dt, end_dt, refresh=refresh)
-        events = _filter(events, query=query, categories=categories, location=location)
+        tagged = await _gather_events(sources, start_dt, end_dt, refresh=refresh)
+        tagged = [
+            t
+            for t in tagged
+            if _matches(t[1], query=query, categories=categories, location=location)
+        ]
+        tagged.sort(key=lambda t: t[1].start)
         limit = max(1, min(limit, MAX_RESULTS))
-        events = events[:limit]
-        return _render(events, detail)
+        tagged = tagged[:limit]
+        return _render(tagged, detail, show_calendar=len(sources) > 1)
 
     @mcp.tool()
     async def events_on(
         date: str,
-        calendar: str | None = None,
+        calendar: str | list[str] | None = None,
         detail: Detail = "brief",
         refresh: bool = False,
     ) -> Any:
         """Return events occurring on a specific date (YYYY-MM-DD).
 
+        `calendar` works as in `list_events`: a name, a list of names, or
+        omitted for *all* configured calendars. When more than one calendar
+        is queried, events carry a `calendar` field and are sorted by start.
+
         Pass `refresh=True` to bypass the TTL cache and re-fetch the
         upstream calendar.
         """
         await registry.maybe_reload()
-        source = registry.resolve(calendar)
+        sources = registry.resolve_many(calendar)
         day = _parse_when(date)
         if day is None:
             raise ValueError("date is required")
         start = datetime.combine(day.date(), time.min, tzinfo=day.tzinfo)
         end = start + timedelta(days=1)
-        events = await source.events(start, end, refresh=refresh)
-        return _render(events, detail)
+        tagged = await _gather_events(sources, start, end, refresh=refresh)
+        tagged.sort(key=lambda t: t[1].start)
+        return _render(tagged, detail, show_calendar=len(sources) > 1)
 
     @mcp.tool()
     async def get_event(
@@ -301,7 +393,7 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         event = await source.get_event(uid, refresh=refresh)
         if event is None:
             return None
-        return _render([event], detail) if detail != "markdown" else event.as_markdown()
+        return _render([(source.name, event)], detail, show_calendar=False)
 
     return mcp
 

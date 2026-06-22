@@ -82,6 +82,12 @@ claude mcp add webcal -- webcal-mcp
 | `events_on` | All events occurring on a given date. |
 | `get_event` | Full record for a single UID. |
 
+`list_events` and `events_on` accept `calendar` as a single name, a list of
+names, or omitted — omitting it queries **all** configured calendars. When more
+than one calendar is queried, each event is tagged with its source `calendar`
+and results are merged and sorted by start time; an unreachable calendar is
+skipped (best-effort) rather than failing the whole request.
+
 Recurring events are expanded within the requested window. Responses are
 cached in memory with a per-calendar TTL; revalidation uses HTTP `ETag` and
 `Last-Modified`.

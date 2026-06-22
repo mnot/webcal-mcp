@@ -26,17 +26,20 @@ class Event:
     categories: tuple[str, ...] = ()
     recurrence_id: str = ""
 
-    def as_brief(self) -> dict[str, Any]:
-        return {
+    def as_brief(self, calendar: str | None = None) -> dict[str, Any]:
+        out: dict[str, Any] = {
             "uid": self.uid,
             "summary": self.summary,
             "start": _iso(self.start, self.all_day),
             "end": _iso(self.end, self.all_day),
             "all_day": self.all_day,
         }
+        if calendar is not None:
+            out["calendar"] = calendar
+        return out
 
-    def as_full(self) -> dict[str, Any]:
-        out = self.as_brief()
+    def as_full(self, calendar: str | None = None) -> dict[str, Any]:
+        out = self.as_brief(calendar)
         out.update(
             {
                 "description": self.description,
@@ -52,9 +55,11 @@ class Event:
             out["recurrence_id"] = self.recurrence_id
         return out
 
-    def as_markdown(self) -> str:
+    def as_markdown(self, calendar: str | None = None) -> str:
         """Compact LLM-friendly rendering."""
         lines = [f"## {self.summary or '(no title)'}"]
+        if calendar is not None:
+            lines.append(f"**Calendar:** {calendar}")
         when = f"{_iso(self.start, self.all_day)} → {_iso(self.end, self.all_day)}"
         if self.all_day:
             when += "  (all day)"
