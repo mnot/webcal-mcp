@@ -49,14 +49,8 @@ class CalendarRegistry:
         invocation; the actual re-read only happens when the mtime moved.
         Lets config edits land without the client restarting the server.
         """
-        path = self._config_path
-        if path is None:
-            return
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return
-        if mtime == self._config_mtime:
+        mtime = self._read_mtime()
+        if mtime is None or mtime == self._config_mtime:
             return
         # Record the mtime up front so a config that fails to parse isn't
         # re-read on every call; the next edit will bump the mtime again.
