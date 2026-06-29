@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,11 +14,14 @@ from webcal_mcp.config import CalendarConfig, Config, load_config
 from webcal_mcp.parser import Event
 from webcal_mcp.server import (
     DEFAULT_WINDOW_DAYS,
+    MAX_WINDOW_DAYS,
     CalendarRegistry,
     _gather_events,
     _matches,
     _render,
     _resolve_window,
+    _ResourceGate,
+    _warn_failures,
     build_server,
 )
 from webcal_mcp.source import CalendarSource
@@ -70,6 +74,70 @@ def test_resolve_window_open_end() -> None:
 def test_resolve_window_pushes_end_to_end_of_day() -> None:
     _, end = _resolve_window("2026-06-01", "2026-06-02")
     assert end.hour == 23 and end.minute == 59
+
+
+def test_resolve_window_rejects_end_before_start() -> None:
+    with pytest.raises(ValueError, match="before start"):
+        _resolve_window("2026-06-10", "2026-06-01")
+
+
+def test_resolve_window_rejects_overwide_span() -> None:
+    with pytest.raises(ValueError, match="exceeds the maximum"):
+        _resolve_window("2000-01-01", "2030-01-01")
+
+
+@pytest.mark.asyncio
+async def test_gate_writer_waits_for_active_reader() -> None:
+    gate = _ResourceGate()
+    order: list[str] = []
+
+    async def reader() -> None:
+        async with gate.read():
+            order.append("read-enter")
+            await asyncio.sleep(0.05)
+            order.append("read-exit")
+
+    async def writer() -> None:
+        async with gate.write():
+            order.append("write")
+
+    r = asyncio.create_task(reader())
+    await asyncio.sleep(0.01)  # let the reader take its lease first
+    w = asyncio.create_task(writer())
+    await asyncio.gather(r, w)
+    # The writer must not run until the reader has fully released.
+    assert order == ["read-enter", "read-exit", "write"]
+
+
+@pytest.mark.asyncio
+async def test_gate_new_reader_defers_to_pending_writer() -> None:
+    gate = _ResourceGate()
+    order: list[str] = []
+
+    async def reader(tag: str, hold: float) -> None:
+        async with gate.read():
+            order.append(f"read-{tag}")
+            await asyncio.sleep(hold)
+
+    async def writer() -> None:
+        async with gate.write():
+            order.append("write")
+
+    r1 = asyncio.create_task(reader("1", 0.05))
+    await asyncio.sleep(0.01)  # r1 holds the lease
+    w = asyncio.create_task(writer())
+    await asyncio.sleep(0.01)  # writer is now waiting on r1
+    r2 = asyncio.create_task(reader("2", 0.0))  # arrives while writer pending
+    await asyncio.gather(r1, w, r2)
+    # r2 must wait behind the pending writer rather than barging in.
+    assert order == ["read-1", "write", "read-2"]
+
+
+def test_resolve_window_allows_span_at_limit() -> None:
+    start, end = _resolve_window("2026-01-01", None)
+    far = (start + timedelta(days=MAX_WINDOW_DAYS - 1)).date().isoformat()
+    # A span just under the cap is accepted.
+    _resolve_window("2026-01-01", far)
 
 
 def _matching(
@@ -184,8 +252,9 @@ async def test_gather_events_tags_and_collects() -> None:
     src_a = _FakeSource("a", [_at("a1", 2)])
     src_b = _FakeSource("b", [_at("b1", 1)])
     win = _resolve_window(None, None)
-    tagged = await _gather_events([src_a, src_b], *win, refresh=False)
+    tagged, failures = await _gather_events([src_a, src_b], *win, refresh=False)
     assert {(name, e.uid) for name, e in tagged} == {("a", "a1"), ("b", "b1")}
+    assert failures == []
 
 
 @pytest.mark.asyncio
@@ -193,8 +262,9 @@ async def test_gather_events_partial_failure_is_best_effort() -> None:
     good = _FakeSource("good", [_at("g1", 1)])
     bad = _FakeSource("bad", error="boom")
     win = _resolve_window(None, None)
-    tagged = await _gather_events([good, bad], *win, refresh=False)
+    tagged, failures = await _gather_events([good, bad], *win, refresh=False)
     assert [(name, e.uid) for name, e in tagged] == [("good", "g1")]
+    assert failures == [("bad", "boom")]
 
 
 @pytest.mark.asyncio
@@ -204,6 +274,32 @@ async def test_gather_events_raises_when_all_fail() -> None:
     win = _resolve_window(None, None)
     with pytest.raises(ValueError, match="All calendars failed"):
         await _gather_events([bad1, bad2], *win, refresh=False)
+
+
+class _RecordingCtx:
+    """Minimal stand-in for the FastMCP Context, capturing warnings."""
+
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+
+    async def warning(self, message: str) -> None:
+        self.warnings.append(message)
+
+
+@pytest.mark.asyncio
+async def test_warn_failures_surfaces_each_skipped_calendar() -> None:
+    ctx = _RecordingCtx()
+    await _warn_failures(ctx, [("work", "timeout"), ("home", "boom")])
+    assert len(ctx.warnings) == 1
+    assert "work (timeout)" in ctx.warnings[0]
+    assert "home (boom)" in ctx.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_warn_failures_silent_when_none() -> None:
+    ctx = _RecordingCtx()
+    await _warn_failures(ctx, [])
+    assert ctx.warnings == []
 
 
 def test_render_tags_calendar_when_requested() -> None:
