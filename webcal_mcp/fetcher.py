@@ -67,7 +67,9 @@ class IcsHttpSource(CalendarSource):
                 )
                 return self._cache.calendar
             resp.raise_for_status()
-            cal = parse_calendar(resp.content)
+            # Parsing is pure-Python and CPU-bound; run it off the event loop
+            # so a large feed doesn't freeze the whole server while it parses.
+            cal = await asyncio.to_thread(parse_calendar, resp.content)
             self._cache = _CacheEntry(
                 calendar=cal,
                 fetched_at=now,
@@ -78,8 +80,10 @@ class IcsHttpSource(CalendarSource):
 
     async def events(self, start: datetime, end: datetime, *, refresh: bool = False) -> list[Event]:
         cal = await self._calendar(refresh=refresh)
-        return expand_events(cal, start, end)
+        # Recurrence expansion is unbounded CPU work (and runs on every call,
+        # since only the parsed calendar is cached); keep it off the loop.
+        return await asyncio.to_thread(expand_events, cal, start, end)
 
     async def get_event(self, uid: str, *, refresh: bool = False) -> Event | None:
         cal = await self._calendar(refresh=refresh)
-        return find_master(cal, uid)
+        return await asyncio.to_thread(find_master, cal, uid)
