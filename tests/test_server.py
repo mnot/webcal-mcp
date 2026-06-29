@@ -133,6 +133,32 @@ async def test_gate_new_reader_defers_to_pending_writer() -> None:
     assert order == ["read-1", "write", "read-2"]
 
 
+@pytest.mark.asyncio
+async def test_gate_failed_write_still_wakes_deferred_reader() -> None:
+    gate = _ResourceGate()
+    order: list[str] = []
+
+    async def reader() -> None:
+        async with gate.read():
+            order.append("read")
+
+    async def failing_writer() -> None:
+        with pytest.raises(RuntimeError):
+            async with gate.write():
+                order.append("write-body")
+                raise RuntimeError("reload boom")
+
+    async with gate.read():  # hold a lease so the writer must wait
+        w = asyncio.create_task(failing_writer())
+        await asyncio.sleep(0.01)  # writer now parked on this reader
+        r = asyncio.create_task(reader())  # defers behind the pending writer
+        await asyncio.sleep(0.01)
+    # Releasing the lease lets the writer run; its body raises. The deferred
+    # reader must still be woken rather than hang.
+    await asyncio.wait_for(asyncio.gather(w, r), timeout=1.0)
+    assert order == ["write-body", "read"]
+
+
 def test_resolve_window_allows_span_at_limit() -> None:
     start, end = _resolve_window("2026-01-01", None)
     far = (start + timedelta(days=MAX_WINDOW_DAYS - 1)).date().isoformat()

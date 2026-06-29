@@ -74,10 +74,13 @@ class _ResourceGate:
             try:
                 while self._readers:
                     await self._cond.wait()
+                yield
             finally:
+                # Always re-arm deferred readers, even if waiting was cancelled
+                # or the body raised (e.g. an aclose() during reload). Skipping
+                # the notify would strand a reader parked in read() forever.
                 self._writers_waiting -= 1
-            yield
-            self._cond.notify_all()
+                self._cond.notify_all()
 
 
 class CalendarRegistry:
