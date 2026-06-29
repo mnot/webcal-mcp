@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 from dateutil import parser as dateparse
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from .config import CalendarConfig, Config, load_config, resolve_config_path
 from .fetcher import IcsHttpSource
@@ -19,8 +21,66 @@ from .source import CalendarSource
 
 Detail = Literal["brief", "full", "markdown"]
 
+# We only use the context to emit log notifications, so the session/lifespan/
+# request type parameters are immaterial here.
+ToolContext = Context[Any, Any, Any]
+
 DEFAULT_WINDOW_DAYS = 30
 MAX_RESULTS = 500
+# Recurrence expansion cost scales with the window width (a daily event over
+# N days is N occurrences), so cap how wide a span a caller can ask for. ~5
+# years is generous for real queries while keeping expansion bounded.
+MAX_WINDOW_DAYS = 1830
+
+
+class _ResourceGate:
+    """A readers-writer gate over the registry's swappable resources.
+
+    A tool call holds a shared *read* lease while it resolves sources and
+    fetches through them; a config reload takes the exclusive *write* lease
+    before swapping or closing those resources. This stops a reload from
+    closing the shared httpx client out from under an in-flight request.
+    Writers take priority, so a steady stream of reads can't starve a
+    pending reload.
+    """
+
+    def __init__(self) -> None:
+        self._cond = asyncio.Condition()
+        self._readers = 0
+        self._writers_waiting = 0
+
+    @asynccontextmanager
+    async def read(self) -> AsyncIterator[None]:
+        async with self._cond:
+            # Defer to a pending/active writer rather than barging in.
+            while self._writers_waiting:
+                await self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+    @asynccontextmanager
+    async def write(self) -> AsyncIterator[None]:
+        # Hold the condition lock across the whole critical section: once the
+        # readers drain we never await again until the body completes, so no
+        # new reader can slip in while resources are being swapped/closed.
+        async with self._cond:
+            self._writers_waiting += 1
+            try:
+                while self._readers:
+                    await self._cond.wait()
+                yield
+            finally:
+                # Always re-arm deferred readers, even if waiting was cancelled
+                # or the body raised (e.g. an aclose() during reload). Skipping
+                # the notify would strand a reader parked in read() forever.
+                self._writers_waiting -= 1
+                self._cond.notify_all()
 
 
 class CalendarRegistry:
@@ -32,7 +92,16 @@ class CalendarRegistry:
             name: self._build_source(c) for name, c in config.calendars.items()
         }
         self._reload_lock = asyncio.Lock()
+        self._gate = _ResourceGate()
         self._config_mtime = self._read_mtime()
+
+    def reading(self) -> AbstractAsyncContextManager[None]:
+        """Shared lease held by a tool call while it fetches through sources.
+
+        A reload waits for outstanding leases to drain before swapping or
+        closing resources, so the shared client can't be closed mid-request.
+        """
+        return self._gate.read()
 
     def _read_mtime(self) -> float | None:
         if self._config_path is None:
@@ -59,8 +128,14 @@ class CalendarRegistry:
 
     @staticmethod
     def _make_client(config: Config) -> httpx.AsyncClient:
+        # Bound the connect phase separately so an unreachable host fails fast
+        # instead of tying up the full (read-oriented) timeout just to connect.
+        timeout = httpx.Timeout(
+            config.http_timeout_seconds,
+            connect=min(10.0, config.http_timeout_seconds),
+        )
         return httpx.AsyncClient(
-            timeout=config.http_timeout_seconds,
+            timeout=timeout,
             headers={"User-Agent": config.user_agent},
             follow_redirects=True,
         )
@@ -86,34 +161,37 @@ class CalendarRegistry:
             if new_config == self._config:
                 return
 
-            # Global HTTP settings are baked into the client; if they changed
-            # the client (and therefore every ICS source) must be rebuilt.
-            client_changed = (
-                new_config.http_timeout_seconds != self._config.http_timeout_seconds
-                or new_config.user_agent != self._config.user_agent
-            )
-            old_client = self._client
-            if client_changed:
-                self._client = self._make_client(new_config)
-
-            new_sources: dict[str, CalendarSource] = {}
-            for name, cfg in new_config.calendars.items():
-                reuse = (
-                    not client_changed
-                    and name in self._sources
-                    and self._config.calendars.get(name) == cfg
+            # Swap resources under the write lease so no in-flight tool call
+            # is still using the client/sources we're about to close.
+            async with self._gate.write():
+                # Global HTTP settings are baked into the client; if they
+                # changed the client (and every ICS source) must be rebuilt.
+                client_changed = (
+                    new_config.http_timeout_seconds != self._config.http_timeout_seconds
+                    or new_config.user_agent != self._config.user_agent
                 )
-                new_sources[name] = self._sources[name] if reuse else self._build_source(cfg)
+                old_client = self._client
+                if client_changed:
+                    self._client = self._make_client(new_config)
 
-            old_sources = self._sources
-            self._sources = new_sources
-            self._config = new_config
+                new_sources: dict[str, CalendarSource] = {}
+                for name, cfg in new_config.calendars.items():
+                    reuse = (
+                        not client_changed
+                        and name in self._sources
+                        and self._config.calendars.get(name) == cfg
+                    )
+                    new_sources[name] = self._sources[name] if reuse else self._build_source(cfg)
 
-            for name, src in old_sources.items():
-                if src is not new_sources.get(name):
-                    await src.aclose()
-            if client_changed:
-                await old_client.aclose()
+                old_sources = self._sources
+                self._sources = new_sources
+                self._config = new_config
+
+                for name, src in old_sources.items():
+                    if src is not new_sources.get(name):
+                        await src.aclose()
+                if client_changed:
+                    await old_client.aclose()
 
     def _build_source(self, cfg: CalendarConfig) -> CalendarSource:
         if cfg.source == "ics":
@@ -201,6 +279,13 @@ def _resolve_window(start: str | None, end: str | None) -> tuple[datetime, datet
         start_dt = end_dt - timedelta(days=DEFAULT_WINDOW_DAYS)
     elif end_dt is None:
         end_dt = start_dt + timedelta(days=DEFAULT_WINDOW_DAYS)
+    if end_dt < start_dt:
+        raise ValueError(f"end ({end!r}) is before start ({start!r})")
+    if (end_dt - start_dt) > timedelta(days=MAX_WINDOW_DAYS):
+        raise ValueError(
+            f"Requested window exceeds the maximum of {MAX_WINDOW_DAYS} days; "
+            "narrow the start/end range."
+        )
     return start_dt, end_dt
 
 
@@ -230,32 +315,48 @@ async def _gather_events(
     end: datetime,
     *,
     refresh: bool,
-) -> list[tuple[str, Event]]:
+) -> tuple[list[tuple[str, Event]], list[tuple[str, str]]]:
     """Fetch from each source concurrently, best-effort, tagging by calendar.
 
-    A source that fails is logged to stderr and skipped, so one unreachable
-    calendar doesn't sink the whole query. Raises only when every source
-    fails — the caller then sees a real error rather than a silent empty list.
+    Returns the tagged events together with a list of ``(calendar, message)``
+    for any sources that failed. A failed source is logged to stderr and
+    skipped, so one unreachable calendar doesn't sink the whole query; the
+    failures list lets the caller surface which ones were dropped. Raises only
+    when every source fails — the caller then sees a real error rather than a
+    silent empty list.
     """
     results = await asyncio.gather(
         *(src.events(start, end, refresh=refresh) for src in sources),
         return_exceptions=True,
     )
     tagged: list[tuple[str, Event]] = []
-    failures: list[tuple[str, BaseException]] = []
+    failures: list[tuple[str, str]] = []
     for src, res in zip(sources, results):
         if isinstance(res, Exception):
-            failures.append((src.name, res))
+            failures.append((src.name, str(res) or res.__class__.__name__))
         elif isinstance(res, BaseException):
             raise res  # don't swallow cancellation / system-exiting signals
         else:
             tagged.extend((src.name, ev) for ev in res)
-    for name, exc in failures:
-        print(f"webcal-mcp: failed to fetch calendar {name!r}: {exc}", file=sys.stderr)
+    for name, msg in failures:
+        print(f"webcal-mcp: failed to fetch calendar {name!r}: {msg}", file=sys.stderr)
     if failures and len(failures) == len(sources):
-        detail = "; ".join(f"{name}: {exc}" for name, exc in failures)
+        detail = "; ".join(f"{name}: {msg}" for name, msg in failures)
         raise ValueError(f"All calendars failed to fetch: {detail}")
-    return tagged
+    return tagged, failures
+
+
+async def _warn_failures(ctx: ToolContext, failures: list[tuple[str, str]]) -> None:
+    """Tell the MCP client which calendars were skipped, if any.
+
+    Partial failures are otherwise invisible to the caller (they only reach
+    stderr), so a query that silently drops a calendar looks like it returned
+    a complete result.
+    """
+    if not failures:
+        return
+    detail = "; ".join(f"{name} ({msg})" for name, msg in failures)
+    await ctx.warning(f"Some calendars were skipped after failing to fetch: {detail}")
 
 
 def _render(tagged: list[tuple[str, Event]], detail: Detail, *, show_calendar: bool) -> Any:
@@ -282,17 +383,19 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         since the server started are picked up without a restart.
         """
         await registry.maybe_reload()
-        return [
-            {
-                "name": c.name,
-                "description": c.description,
-                "writable": registry.resolve(c.name).writable,
-            }
-            for c in registry.config.calendars.values()
-        ]
+        async with registry.reading():
+            return [
+                {
+                    "name": c.name,
+                    "description": c.description,
+                    "writable": registry.resolve(c.name).writable,
+                }
+                for c in registry.config.calendars.values()
+            ]
 
     @mcp.tool()
     async def list_events(
+        ctx: ToolContext,
         calendar: str | list[str] | None = None,
         start: str | None = None,
         end: str | None = None,
@@ -312,6 +415,7 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
           merged and sorted by start time.
         - `start` / `end`: ISO date or datetime. Either may be omitted for an
           open-ended window; a default 30-day window applies if both are omitted.
+          The span between an explicit start and end may not exceed ~5 years.
         - `query`: case-insensitive substring match against summary + description.
         - `categories`: match if the event has any of these categories.
         - `location`: case-insensitive substring match against location.
@@ -324,9 +428,12 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
           the cached copy may be stale.
         """
         await registry.maybe_reload()
-        sources = registry.resolve_many(calendar)
         start_dt, end_dt = _resolve_window(start, end)
-        tagged = await _gather_events(sources, start_dt, end_dt, refresh=refresh)
+        async with registry.reading():
+            sources = registry.resolve_many(calendar)
+            n_sources = len(sources)
+            tagged, failures = await _gather_events(sources, start_dt, end_dt, refresh=refresh)
+        await _warn_failures(ctx, failures)
         tagged = [
             t
             for t in tagged
@@ -335,10 +442,11 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         tagged.sort(key=lambda t: t[1].start)
         limit = max(1, min(limit, MAX_RESULTS))
         tagged = tagged[:limit]
-        return _render(tagged, detail, show_calendar=len(sources) > 1)
+        return _render(tagged, detail, show_calendar=n_sources > 1)
 
     @mcp.tool()
     async def events_on(
+        ctx: ToolContext,
         date: str,
         calendar: str | list[str] | None = None,
         detail: Detail = "brief",
@@ -354,15 +462,18 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         upstream calendar.
         """
         await registry.maybe_reload()
-        sources = registry.resolve_many(calendar)
         day = _parse_when(date)
         if day is None:
             raise ValueError("date is required")
         start = datetime.combine(day.date(), time.min, tzinfo=day.tzinfo)
         end = start + timedelta(days=1)
-        tagged = await _gather_events(sources, start, end, refresh=refresh)
+        async with registry.reading():
+            sources = registry.resolve_many(calendar)
+            n_sources = len(sources)
+            tagged, failures = await _gather_events(sources, start, end, refresh=refresh)
+        await _warn_failures(ctx, failures)
         tagged.sort(key=lambda t: t[1].start)
-        return _render(tagged, detail, show_calendar=len(sources) > 1)
+        return _render(tagged, detail, show_calendar=n_sources > 1)
 
     @mcp.tool()
     async def get_event(
@@ -377,11 +488,13 @@ def build_server(registry: CalendarRegistry) -> FastMCP:
         upstream calendar.
         """
         await registry.maybe_reload()
-        source = registry.resolve(calendar)
-        event = await source.get_event(uid, refresh=refresh)
+        async with registry.reading():
+            source = registry.resolve(calendar)
+            name = source.name
+            event = await source.get_event(uid, refresh=refresh)
         if event is None:
             return None
-        return _render([(source.name, event)], detail, show_calendar=False)
+        return _render([(name, event)], detail, show_calendar=False)
 
     return mcp
 

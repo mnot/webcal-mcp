@@ -127,6 +127,22 @@ def test_no_calendars_rejected(tmp_path: Path) -> None:
         load_config(_write(tmp_path, "default_ttl_seconds = 60\n"))
 
 
+@pytest.mark.parametrize("bad", ["0", "-5"])
+def test_nonpositive_timeout_rejected(tmp_path: Path, bad: str) -> None:
+    with pytest.raises(ValueError, match="http_timeout_seconds"):
+        load_config(
+            _write(
+                tmp_path,
+                f"""\
+                http_timeout_seconds = {bad}
+
+                [calendars.only]
+                url = "https://example.com/o.ics"
+                """,
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "url,expected",
     [
