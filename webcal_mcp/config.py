@@ -74,6 +74,10 @@ def load_config(path: Path | None = None) -> Config:
 
     default_ttl = int(raw.get("default_ttl_seconds", DEFAULT_TTL_SECONDS))
     timeout = float(raw.get("http_timeout_seconds", 30.0))
+    if timeout <= 0:
+        # httpx reads a non-positive timeout as "no timeout", which turns a
+        # slow or stuck upstream into an indefinite hang. Reject it up front.
+        raise ValueError("http_timeout_seconds must be greater than 0")
     user_agent = str(raw.get("user_agent", "webcal-mcp/0.1"))
 
     calendars: dict[str, CalendarConfig] = {}
