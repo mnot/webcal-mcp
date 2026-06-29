@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, cast
+from typing import Any
 
 import icalendar
 import recurring_ical_events  # type: ignore[import-untyped]
@@ -90,7 +90,7 @@ def _iso(dt: datetime, all_day: bool) -> str:
 
 
 def parse_calendar(data: bytes) -> icalendar.Calendar:
-    return cast(icalendar.Calendar, icalendar.Calendar.from_ical(data))
+    return icalendar.Calendar.from_ical(data)
 
 
 def _coerce_dt(value: Any) -> tuple[datetime, bool]:
@@ -105,14 +105,14 @@ def _coerce_dt(value: Any) -> tuple[datetime, bool]:
 
 
 def _str(component: icalendar.Component, key: str) -> str:
-    val = component.get(key)  # type: ignore[no-untyped-call]
+    val = component.get(key)
     if val is None:
         return ""
     return str(val)
 
 
 def _attendees(component: icalendar.Component) -> tuple[str, ...]:
-    raw = component.get("attendee")  # type: ignore[no-untyped-call]
+    raw = component.get("attendee")
     if raw is None:
         return ()
     if not isinstance(raw, list):
@@ -121,7 +121,7 @@ def _attendees(component: icalendar.Component) -> tuple[str, ...]:
 
 
 def _categories(component: icalendar.Component) -> tuple[str, ...]:
-    raw = component.get("categories")  # type: ignore[no-untyped-call]
+    raw = component.get("categories")
     if raw is None:
         return ()
     cats = getattr(raw, "cats", None)
@@ -131,17 +131,15 @@ def _categories(component: icalendar.Component) -> tuple[str, ...]:
 
 
 def to_event(component: icalendar.Component) -> Event:
-    dtstart_field = component.get("dtstart")  # type: ignore[no-untyped-call]
-    dtend_field = component.get("dtend") or component.get(  # type: ignore[no-untyped-call]
-        "dtstart"
-    )
+    dtstart_field = component.get("dtstart")
+    dtend_field = component.get("dtend") or component.get("dtstart")
     start_raw = dtstart_field.dt if dtstart_field is not None else None
     end_raw = dtend_field.dt if dtend_field is not None else None
     if start_raw is None or end_raw is None:
         raise ValueError("event missing DTSTART")
     start, all_day = _coerce_dt(start_raw)
     end, _ = _coerce_dt(end_raw)
-    rec_id = component.get("recurrence-id")  # type: ignore[no-untyped-call]
+    rec_id = component.get("recurrence-id")
     return Event(
         uid=_str(component, "uid"),
         summary=_str(component, "summary"),
