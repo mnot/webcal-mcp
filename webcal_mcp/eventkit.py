@@ -51,6 +51,7 @@ class EventKitSource(CalendarSource):
         self._identifier = config.identifier or config.name
         self._store: Any = None
         self._calendar: Any = None
+        self._entity_type: Any = None
         self._lock = asyncio.Lock()
 
     async def _ensure_ready(self) -> None:
@@ -94,6 +95,23 @@ class EventKitSource(CalendarSource):
         cal = self._find_calendar(store, entity_type)
         self._store = store
         self._calendar = cal
+        self._entity_type = entity_type
+
+    def _reset_store(self) -> None:
+        """Drop the store's in-process snapshot so the next read reflects
+        external edits.
+
+        A long-lived ``EKEventStore`` is a snapshot: changes made by another
+        process (Calendar.app, the system sync daemon) are invisible until the
+        store is told to reset. ``refreshSourcesIfNecessary`` only pulls new
+        data from *remote* sources into the local database; ``reset`` is what
+        drops the cached objects so a subsequent fetch re-reads from disk.
+        ``reset`` also invalidates previously fetched calendars, so we
+        re-resolve our handle afterwards.
+        """
+        self._store.refreshSourcesIfNecessary()
+        self._store.reset()
+        self._calendar = self._find_calendar(self._store, self._entity_type)
 
     def _find_calendar(self, store: Any, entity_type: Any) -> Any:
         cals = list(store.calendarsForEntityType_(entity_type) or [])
@@ -119,12 +137,17 @@ class EventKitSource(CalendarSource):
 
     async def events(self, start: datetime, end: datetime, *, refresh: bool = False) -> list[Event]:
         await self._ensure_ready()
-        return await asyncio.to_thread(self._events_blocking, start, end, refresh)
+        # EKEventStore isn't thread-safe; serialize all access to it (and keep
+        # a refresh's reset atomic with the query that consumes it) under the
+        # per-source lock. Different sources hold different locks, so
+        # cross-calendar queries still run concurrently.
+        async with self._lock:
+            if refresh:
+                await asyncio.to_thread(self._reset_store)
+            return await asyncio.to_thread(self._events_blocking, start, end)
 
-    def _events_blocking(self, start: datetime, end: datetime, refresh: bool) -> list[Event]:
+    def _events_blocking(self, start: datetime, end: datetime) -> list[Event]:
         _, _, ns_date_cls = _import_eventkit()
-        if refresh:
-            self._store.refreshSourcesIfNecessary()
         ns_start = ns_date_cls.dateWithTimeIntervalSince1970_(start.timestamp())
         ns_end = ns_date_cls.dateWithTimeIntervalSince1970_(end.timestamp())
         predicate = self._store.predicateForEventsWithStartDate_endDate_calendars_(
@@ -137,11 +160,12 @@ class EventKitSource(CalendarSource):
 
     async def get_event(self, uid: str, *, refresh: bool = False) -> Event | None:
         await self._ensure_ready()
-        return await asyncio.to_thread(self._get_event_blocking, uid, refresh)
+        async with self._lock:
+            if refresh:
+                await asyncio.to_thread(self._reset_store)
+            return await asyncio.to_thread(self._get_event_blocking, uid)
 
-    def _get_event_blocking(self, uid: str, refresh: bool) -> Event | None:
-        if refresh:
-            self._store.refreshSourcesIfNecessary()
+    def _get_event_blocking(self, uid: str) -> Event | None:
         items = list(self._store.calendarItemsWithExternalIdentifier_(uid) or [])
         for item in items:
             if item.calendar() == self._calendar:

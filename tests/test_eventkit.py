@@ -127,6 +127,33 @@ def test_identifier_defaults_to_name() -> None:
     assert src._find_calendar(_fake_store(cals), object()).title() == "Calendars"
 
 
+def test_reset_store_refreshes_and_reresolves_calendar() -> None:
+    """refresh drops the store's stale snapshot and re-resolves the calendar.
+
+    A held EKEventStore doesn't see edits made by another process until it's
+    reset; `refreshSourcesIfNecessary` alone (remote sync) doesn't surface a
+    local edit. `_reset_store` must call both, in order, then re-resolve the
+    (now-invalidated) calendar handle.
+    """
+    calls: list[str] = []
+    stale_cal = _fake_cal("Work", "uuid-B")
+    fresh_cal = _fake_cal("Work", "uuid-B")
+    store = SimpleNamespace(
+        refreshSourcesIfNecessary=lambda: calls.append("refresh"),
+        reset=lambda: calls.append("reset"),
+        calendarsForEntityType_=lambda _t: [fresh_cal],
+    )
+    src = _source("Work")
+    src._store = store
+    src._entity_type = object()
+    src._calendar = stale_cal
+
+    src._reset_store()
+
+    assert calls == ["refresh", "reset"]  # remote pull before dropping cache
+    assert src._calendar is fresh_cal  # re-resolved, not the stale handle
+
+
 @pytest.mark.skipif(
     HAS_PYOBJC, reason="PyObjC is installed; can't exercise the missing-import path"
 )
