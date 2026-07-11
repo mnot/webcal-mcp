@@ -113,10 +113,6 @@ class EventKitSource(CalendarSource):
         self._store.reset()
         self._calendar = self._find_calendar(self._store, self._entity_type)
 
-    async def _refresh(self) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._reset_store)
-
     def _find_calendar(self, store: Any, entity_type: Any) -> Any:
         cals = list(store.calendarsForEntityType_(entity_type) or [])
         ident = self._identifier
@@ -141,9 +137,14 @@ class EventKitSource(CalendarSource):
 
     async def events(self, start: datetime, end: datetime, *, refresh: bool = False) -> list[Event]:
         await self._ensure_ready()
-        if refresh:
-            await self._refresh()
-        return await asyncio.to_thread(self._events_blocking, start, end)
+        # EKEventStore isn't thread-safe; serialize all access to it (and keep
+        # a refresh's reset atomic with the query that consumes it) under the
+        # per-source lock. Different sources hold different locks, so
+        # cross-calendar queries still run concurrently.
+        async with self._lock:
+            if refresh:
+                await asyncio.to_thread(self._reset_store)
+            return await asyncio.to_thread(self._events_blocking, start, end)
 
     def _events_blocking(self, start: datetime, end: datetime) -> list[Event]:
         _, _, ns_date_cls = _import_eventkit()
@@ -159,9 +160,10 @@ class EventKitSource(CalendarSource):
 
     async def get_event(self, uid: str, *, refresh: bool = False) -> Event | None:
         await self._ensure_ready()
-        if refresh:
-            await self._refresh()
-        return await asyncio.to_thread(self._get_event_blocking, uid)
+        async with self._lock:
+            if refresh:
+                await asyncio.to_thread(self._reset_store)
+            return await asyncio.to_thread(self._get_event_blocking, uid)
 
     def _get_event_blocking(self, uid: str) -> Event | None:
         items = list(self._store.calendarItemsWithExternalIdentifier_(uid) or [])
